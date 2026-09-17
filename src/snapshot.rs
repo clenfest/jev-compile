@@ -29,6 +29,7 @@ pub struct SourceFile {
     pub source: String,
     pub revision: &'static str,
     pub syntax: Syntax,
+    pub screen: bool,
 }
 
 #[derive(Serialize)]
@@ -43,52 +44,8 @@ pub struct Context {
     pub content: String,
 }
 
-impl Snapshot {
-    pub fn state(&self, targets: &BTreeSet<usize>) -> Value {
-        let names: BTreeSet<_> = targets
-            .iter()
-            .flat_map(|index| self.files[*index].syntax.identifiers.iter())
-            .collect();
-        let mut declarations = Vec::new();
-        let mut included = BTreeSet::new();
-        for (index, file) in self.files.iter().enumerate() {
-            if targets.contains(&index) {
-                continue;
-            }
-            for (name, spans) in &file.syntax.declarations {
-                if !names.contains(name) {
-                    continue;
-                }
-                for span in spans {
-                    if !included.insert((index, *span)) {
-                        continue;
-                    }
-                    declarations.push(json!({
-                        "file": file.path, "symbol": name, "revision": file.revision,
-                        "start_line": span.start_line,
-                        "source": file.source.lines().enumerate()
-                            .skip(span.start_line - 1).take(span.width())
-                            .map(|(line, text)| format!("{}: {text}\n", line + 1)).collect::<String>()
-                    }));
-                }
-            }
-        }
-        json!({
-            "base_commit": self.base_commit,
-            "snapshot": self.fingerprint,
-            "language": self.language,
-            "changes": self.changes,
-            "files": targets.iter().map(|index| {
-                let file = &self.files[*index];
-                json!({"path": file.path, "revision": file.revision, "source": syntax::numbered(&file.source)})
-            }).collect::<Vec<_>>(),
-            "context": self.context,
-            "related_declarations": declarations,
-            "context_strategy": "Lexical matching of local declarations and references, not compiler name resolution. External dependencies, aliases, macros, generated files, and configuration may require more context.",
-            "warnings": self.warnings,
-        })
-    }
-}
+#[path = "evidence.rs"]
+mod evidence;
 
 fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
@@ -212,7 +169,7 @@ pub fn collect(
                 "--no-color",
                 "--no-renames",
                 "--ignore-submodules=none",
-                "--unified=12",
+                "--unified=3",
                 &commit,
                 "--",
                 path,
@@ -223,7 +180,7 @@ pub fn collect(
             diff,
         });
         if Language::for_path(path) != Some(language) {
-            warnings.push(format!("Changed file is supplied as diff evidence but not localized for the selected language: {path}"));
+            warnings.push(format!("Changed file is recorded in the snapshot but not analyzed for the selected language: {path}; supply relevant configuration with --context"));
             continue;
         }
         let previous = if baseline_paths.contains(path) {
@@ -232,7 +189,6 @@ pub fn collect(
             String::new()
         };
         let before = Syntax::parse(language, path, &previous)?;
-        changed_names.extend(before.declarations.keys().cloned());
         if std::fs::symlink_metadata(root.join(path))
             .is_ok_and(|metadata| !metadata.file_type().is_file())
         {
@@ -250,13 +206,26 @@ pub fn collect(
             return Err("changed source exceeds the 16 MiB local indexing limit".into());
         }
         let syntax = Syntax::parse(language, path, &source)?;
-        changed_names.extend(syntax.declarations.keys().cloned());
-        references.extend(syntax.identifiers.iter().cloned());
+        for name in before.declarations.keys().chain(syntax.declarations.keys()) {
+            let contracts = |syntax: &Syntax| {
+                syntax.declarations.get(name).map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| entry.evidence.clone())
+                        .collect::<Vec<_>>()
+                })
+            };
+            if revision == "baseline" || contracts(&before) != contracts(&syntax) {
+                changed_names.insert(name.clone());
+            }
+        }
+        references.extend(syntax.identifier_spans.keys().cloned());
         files.push(SourceFile {
             path: path.clone(),
             source,
             revision,
             syntax,
+            screen: true,
         });
     }
     // Inspect one lexical hop. Freeze source once; calls never reread the checkout.
@@ -278,10 +247,11 @@ pub fn collect(
             break;
         }
         let syntax = Syntax::parse(language, &path, &source)?;
-        if syntax
-            .identifiers
-            .iter()
-            .any(|name| changed_names.contains(name))
+        let screen = syntax
+            .identifier_spans
+            .keys()
+            .any(|name| changed_names.contains(name));
+        if screen
             || syntax
                 .declarations
                 .keys()
@@ -292,6 +262,7 @@ pub fn collect(
                 source,
                 revision: "working_tree",
                 syntax,
+                screen,
             });
         }
     }
@@ -315,13 +286,25 @@ pub fn collect(
     };
     let fingerprint = json!({
         "base": snapshot.base_commit, "language": snapshot.language, "changes": snapshot.changes,
-        "files": snapshot.files.iter().map(|file| (&file.path, &file.source, file.revision)).collect::<Vec<_>>(),
+        "files": snapshot.files.iter().map(|file| (&file.path, &file.source, file.revision, file.screen)).collect::<Vec<_>>(),
         "context": snapshot.context, "warnings": snapshot.warnings,
     });
     snapshot.fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&fingerprint)?));
     Ok(snapshot)
 }
 
-pub fn root_span(file: &SourceFile) -> Span {
-    Span::whole(&file.source)
+/// Stable, exhaustive evidence windows. Descendants keep their original window
+/// while localizing, so narrowing a question does not discard its context.
+pub fn screen_spans(file: &SourceFile) -> Vec<Span> {
+    let mut pending = vec![Span::whole(&file.source)];
+    let mut regions = Vec::new();
+    while let Some(region) = pending.pop() {
+        if region.width() > 1 && syntax::numbered_region(&file.source, region).len() > 12_000 {
+            pending.extend(file.syntax.partition(region));
+        } else {
+            regions.push(region);
+        }
+    }
+    regions.sort_unstable();
+    regions
 }

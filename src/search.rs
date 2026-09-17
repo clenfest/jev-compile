@@ -1,7 +1,7 @@
 use crate::{
     language::{Category, OTHER},
     prediction::{self, Phase, Question, Response, Usage},
-    snapshot::{root_span, Snapshot},
+    snapshot::{screen_spans, Snapshot},
     syntax::Span,
     Result,
 };
@@ -16,6 +16,7 @@ const ROUTE_THRESHOLD: f64 = 0.5;
 const REPORT_THRESHOLD: f64 = 0.85;
 const MAX_QUESTIONS: usize = 64;
 
+#[derive(Clone)]
 pub struct Options {
     pub model: String,
     pub top_errors: usize,
@@ -46,6 +47,8 @@ pub struct Call {
     pub number: usize,
     pub phase: Phase,
     pub request_bytes: usize,
+    pub omitted_support_declarations: u64,
+    pub ambiguous_symbols: usize,
     pub latency_ms: u128,
     pub model: Option<String>,
     pub usage: Option<Usage>,
@@ -114,11 +117,14 @@ fn screen_questions(snapshot: &Snapshot, categories: &[Category]) -> VecDeque<Qu
         .files
         .iter()
         .enumerate()
+        .filter(|(_, source)| source.screen)
         .flat_map(|(file, source)| {
-            (0..categories.len()).map(move |category| Question {
-                file,
-                category,
-                region: root_span(source),
+            screen_spans(source).into_iter().flat_map(move |region| {
+                (0..categories.len()).map(move |category| Question {
+                    file,
+                    category,
+                    region,
+                })
             })
         })
         .collect()
@@ -201,6 +207,7 @@ pub fn run(
     mut emit: impl FnMut(&Finding),
 ) -> Report {
     let started = Instant::now();
+    let mut effective_options = options.clone();
     let categories = categories(snapshot, options);
     let mut screens = screen_questions(snapshot, &categories);
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -270,7 +277,7 @@ pub fn run(
         let (batch, tasks, request) = match fitting_batch(
             snapshot,
             &categories,
-            options,
+            &effective_options,
             &model,
             phase,
             jobs.into_iter(),
@@ -289,6 +296,12 @@ pub fn run(
             number: report.calls_used,
             phase,
             request_bytes: serde_json::to_vec(&request).unwrap().len(),
+            omitted_support_declarations: request["state"]["omitted_support"]["declarations"]
+                .as_u64()
+                .unwrap_or(0),
+            ambiguous_symbols: request["state"]["ambiguous_symbols_outside_target_directories"]
+                .as_array()
+                .map_or(0, Vec::len),
             latency_ms: 0,
             model: None,
             usage: None,
@@ -309,8 +322,19 @@ pub fn run(
             Ok(response) => response,
             Err(error) => {
                 receipt.error = Some(error.to_string());
-                report.error = receipt.error.clone();
+                let token_limit = error
+                    .downcast_ref::<prediction::ApiError>()
+                    .is_some_and(prediction::ApiError::token_limit);
+                let request_bytes = receipt.request_bytes;
                 report.calls.push(receipt);
+                if token_limit && report.calls_used < options.max_calls {
+                    effective_options.max_bytes = request_bytes / 2;
+                    report.warnings.push(format!(
+                        "Jev rejected a {request_bytes}-byte request with max_tokens_exceeded; reducing the request cap to {} bytes. The rejected attempt consumed one call.",
+                        effective_options.max_bytes));
+                    continue;
+                }
+                report.error = Some(error.to_string());
                 report.stop_reason = "api_error";
                 break;
             }
@@ -412,6 +436,10 @@ pub fn run(
         && report.error.is_none()
         && report.warnings.is_empty()
         && report.insufficient_context_files.is_empty()
+        && report
+            .calls
+            .iter()
+            .all(|call| call.omitted_support_declarations == 0 && call.ambiguous_symbols == 0)
         && report
             .findings
             .iter()

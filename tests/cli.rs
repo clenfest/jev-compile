@@ -203,6 +203,90 @@ fn signature_changes_include_unchanged_callers_and_local_declarations() {
     assert_eq!(report["calls_used"], 0);
     assert_eq!(report["search_complete"], false);
     assert!(report["unscreened_questions"].as_u64().unwrap() > 0);
+
+    fs::remove_file(repo.path().join("types.rs")).unwrap();
+    let output = cli(repo.path(), &["--dry-run"]);
+    assert!(output.status.success());
+    let request: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(request["state"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file["path"] == "main.rs"));
+}
+
+#[test]
+fn body_edits_do_not_screen_support_files_or_expand_common_methods() {
+    let repo = fixture();
+    fs::write(
+        repo.path().join("main.rs"),
+        "fn main() { let name: Name = make_name(); release(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("types.rs"),
+        format!(
+            "pub type Name = String;\npub fn make_name() -> Name {{\n{}String::new()\n}}\n",
+            "    let temporary = 1;\n".repeat(400)
+        ),
+    )
+    .unwrap();
+    for index in 0..40 {
+        let folder = repo.path().join(format!("module_{index}"));
+        fs::create_dir(&folder).unwrap();
+        fs::write(
+            folder.join("worker.rs"),
+            format!(
+                "struct Worker;\nimpl Worker {{\nfn release(&self) {{\n{} }}\n}}\n",
+                "let temporary = 1;\n".repeat(100)
+            ),
+        )
+        .unwrap();
+    }
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "support baseline",
+        ],
+    );
+    fs::write(
+        repo.path().join("main.rs"),
+        "fn main() { let name: Name = 42; release(); make_name(); }\n",
+    )
+    .unwrap();
+    let output = cli(repo.path(), &["--dry-run"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(request["state"]["files"].as_array().unwrap().len(), 1);
+    assert_eq!(request["state"]["files"][0]["path"], "main.rs");
+    let declarations = request["state"]["related_declarations"].to_string();
+    assert!(declarations.contains("pub fn make_name() -> Name"));
+    assert!(!declarations.contains("temporary"));
+    assert!(!declarations.contains("fn release"));
+    assert!(
+        request["state"]["ambiguous_symbols_outside_target_directories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "release")
+    );
+    let output = cli(repo.path(), &["--max-calls", "0"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["unscreened_questions"], 9);
+    assert!(serde_json::to_vec(&request).unwrap().len() < 20_000);
 }
 
 #[test]

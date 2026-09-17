@@ -41,7 +41,7 @@ struct Args {
     #[arg(long, default_value = "jev-latest")]
     model: String,
     /// Maximum serialized bytes per request; evidence is never silently truncated
-    #[arg(long, default_value_t = 200_000)]
+    #[arg(long, default_value_t = 80_000)]
     max_bytes: usize,
 }
 

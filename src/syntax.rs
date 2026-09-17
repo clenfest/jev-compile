@@ -23,9 +23,14 @@ impl Span {
 }
 
 pub struct Syntax {
-    pub declarations: BTreeMap<String, Vec<Span>>,
-    pub identifiers: BTreeSet<String>,
+    pub declarations: BTreeMap<String, Vec<Declaration>>,
+    pub identifier_spans: BTreeMap<String, Vec<Span>>,
     boundaries: BTreeSet<usize>,
+}
+
+pub struct Declaration {
+    pub span: Span,
+    pub evidence: String,
 }
 
 impl Syntax {
@@ -35,16 +40,19 @@ impl Syntax {
         let tree = parser.parse(source, None).ok_or("could not parse source")?;
         let mut syntax = Self {
             declarations: BTreeMap::new(),
-            identifiers: BTreeSet::new(),
+            identifier_spans: BTreeMap::new(),
             boundaries: BTreeSet::new(),
         };
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
             let kind = node.kind();
             if kind.contains("identifier") {
+                let name = node.utf8_text(source.as_bytes())?.to_owned();
                 syntax
-                    .identifiers
-                    .insert(node.utf8_text(source.as_bytes())?.to_owned());
+                    .identifier_spans
+                    .entry(name)
+                    .or_default()
+                    .push(span(node));
             }
             let declaration = matches!(
                 kind,
@@ -68,7 +76,7 @@ impl Syntax {
                         .declarations
                         .entry(name.utf8_text(source.as_bytes())?.to_owned())
                         .or_default()
-                        .push(declaration_span(node));
+                        .push(describe_declaration(node, source, language));
                 }
             }
             if declaration
@@ -127,24 +135,50 @@ fn span(node: Node<'_>) -> Span {
     }
 }
 
-fn declaration_span(node: Node<'_>) -> Span {
+fn describe_declaration(node: Node<'_>, source: &str, language: Language) -> Declaration {
+    // Ordinary Rust body edits do not change explicit signatures. This is a
+    // heuristic: opaque return types and const evaluation can still affect callers.
+    // TypeScript bodies can change inferred return types, so retain them.
+    let end = if matches!(language, Language::Rust) && node.kind() == "function_item" {
+        node.child_by_field_name("body")
+            .map_or(node.end_byte(), |body| body.start_byte())
+    } else {
+        node.end_byte()
+    };
+    let mut start = node.start_byte();
+    let mut previous = node.prev_named_sibling();
+    while let Some(attribute) = previous.filter(|node| node.kind() == "attribute_item") {
+        start = attribute.start_byte();
+        previous = attribute.prev_named_sibling();
+    }
+    let text = source[start..end].trim_end();
+    let mut evidence = text.to_owned();
     let mut parent = node.parent();
     while let Some(enclosing) = parent {
         if matches!(
             enclosing.kind(),
             "impl_item" | "trait_item" | "class_declaration" | "interface_declaration"
         ) {
-            return span(enclosing);
+            if let Some(body) = enclosing.child_by_field_name("body") {
+                let header = source[enclosing.start_byte()..body.start_byte()].trim_end();
+                evidence = format!("{header} {{\n{evidence}\n}}");
+            }
+            break;
         }
         parent = enclosing.parent();
     }
-    span(node)
+    Declaration {
+        span: span(node),
+        evidence,
+    }
 }
 
-pub fn numbered(source: &str) -> String {
+pub fn numbered_region(source: &str, region: Span) -> String {
     source
         .lines()
         .enumerate()
+        .skip(region.start_line - 1)
+        .take(region.width())
         .map(|(index, line)| format!("{}: {line}\n", index + 1))
         .collect()
 }

@@ -19,6 +19,7 @@ fn fixture(lines: usize) -> Snapshot {
             syntax: Syntax::parse(Language::Rust, "main.rs", &source).unwrap(),
             source,
             revision: "working_tree",
+            screen: true,
         }],
         changes: vec![Change {
             path: "main.rs".into(),
@@ -79,7 +80,10 @@ fn finds_multiple_errors_and_rechecks_each_without_exceeding_budget() {
             sent += 1;
             assert_eq!(
                 request["state"]["files"][0]["source"],
-                crate::syntax::numbered(&snapshot.files[0].source)
+                crate::syntax::numbered_region(
+                    &snapshot.files[0].source,
+                    Span::whole(&snapshot.files[0].source)
+                )
             );
             if sent > 1 {
                 assert_eq!(request["model"], "jev-pinned");
@@ -183,6 +187,7 @@ fn byte_limit_stops_before_dispatch_and_large_screening_sets_are_batched() {
             syntax: Syntax::parse(Language::Rust, "f.rs", &source).unwrap(),
             source,
             revision: "working_tree",
+            screen: true,
         });
     }
     let mut config = options(1);
@@ -199,6 +204,102 @@ fn byte_limit_stops_before_dispatch_and_large_screening_sets_are_batched() {
     assert_eq!(report.calls_used, 1);
     assert!(report.unscreened_questions > 0);
     assert!(!report.search_complete);
+}
+
+#[test]
+fn large_files_use_exhaustive_windows_and_keep_window_context_when_localizing() {
+    let snapshot = fixture(2000);
+    let mut config = options(32);
+    config.max_bytes = 40_000;
+    let windows = screen_spans(&snapshot.files[0]);
+    let mut seen = BTreeSet::new();
+    let report = run(
+        &snapshot,
+        &config,
+        |request| {
+            assert!(serde_json::to_vec(request).unwrap().len() <= config.max_bytes);
+            let file = &request["state"]["files"][0];
+            for question in request["questions"].as_object().unwrap().values() {
+                let instructions = &question["instructions"];
+                let Some(start) = instructions["region"]["start_line"].as_u64() else {
+                    continue;
+                };
+                let end = instructions["region"]["end_line"].as_u64().unwrap();
+                let window = windows
+                    .iter()
+                    .find(|window| {
+                        window.start_line <= start as usize && end as usize <= window.end_line
+                    })
+                    .unwrap();
+                assert!(file["source"].as_str().unwrap().contains(
+                    &crate::syntax::numbered_region(&snapshot.files[0].source, *window)
+                ));
+                seen.insert(*window);
+            }
+            Ok(answer(request, &[777]))
+        },
+        |_| {},
+    );
+    assert!(report.search_complete, "{:?}", report.error);
+    assert_eq!(seen, windows.into_iter().collect());
+    assert!(report
+        .findings
+        .iter()
+        .any(|finding| finding.region.start_line == 777
+            && finding.region.end_line == 777
+            && finding.status == "predicted"));
+}
+
+#[test]
+fn token_rejections_rebatch_pending_work_and_consume_the_same_hard_budget() {
+    let mut snapshot = fixture(1);
+    for index in 0..20 {
+        let source = format!("fn file_{index}() {{}}\n");
+        snapshot.files.push(SourceFile {
+            path: format!("file_{index}.rs"),
+            syntax: Syntax::parse(Language::Rust, "f.rs", &source).unwrap(),
+            source,
+            revision: "working_tree",
+            screen: true,
+        });
+    }
+    for budget in [1, 2] {
+        let mut sent = 0;
+        let mut rejected_size = 0;
+        let mut config = options(budget);
+        config.top_errors = 10;
+        let report = run(
+            &snapshot,
+            &config,
+            |request| {
+                sent += 1;
+                let size = serde_json::to_vec(request).unwrap().len();
+                if sent == 1 {
+                    rejected_size = size;
+                    return Err(Box::new(prediction::ApiError {
+                        status: 400,
+                        error_type: Some("max_tokens_exceeded".into()),
+                    }));
+                }
+                assert!(size <= rejected_size / 2);
+                Ok(answer(request, &[]))
+            },
+            |_| {},
+        );
+        assert_eq!(sent, budget);
+        assert_eq!(report.calls_used, budget);
+        assert!(report.calls[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("max_tokens_exceeded"));
+        assert!(report.unscreened_questions > 0);
+        assert_eq!(report.error.is_some(), budget == 1);
+        if budget == 2 {
+            assert!(report.screened_questions > 0);
+            assert_eq!(report.stop_reason, "call_budget_exhausted");
+        }
+    }
 }
 
 #[test]
@@ -232,6 +333,7 @@ fn final_call_rechecks_localized_findings_before_spending_more_on_broad_regions(
         syntax: Syntax::parse(Language::Rust, "tiny.rs", &source).unwrap(),
         source,
         revision: "working_tree",
+        screen: true,
     });
     let report = run(
         &snapshot,
