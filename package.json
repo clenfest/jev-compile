@@ -1,0 +1,36 @@
+{
+  "name": "jev-compile",
+  "version": "0.1.0",
+  "description": "Experimental Jev-powered compiler error prediction from Git diffs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clenfest/jev-compile.git"
+  },
+  "type": "module",
+  "bin": {
+    "jev-compile": "bin/jev-compile.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/launcher.test.mjs",
+    "format": "prettier --write package.json bin/*.mjs tests/*.mjs README.md"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "prettier": "3.6.2"
+  }
+}
