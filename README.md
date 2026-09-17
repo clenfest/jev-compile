@@ -1,5 +1,11 @@
 # jev-compile
 
+> **Retired September 17, 2026.** Development has stopped and this repository is
+> archived. Evaluation did not demonstrate sufficiently reliable compiler-error
+> detection or an advantage over incremental compilation. Use your language's
+> compiler instead. The source and documentation below are retained as a record
+> of the experiment; the project is no longer maintained.
+
 Experimental compiler-error prediction and localization using [Jev](https://typesafe.ai).
 
 Start with a commit you know compiles. Choose **N error categories** and a maximum
@@ -7,13 +13,9 @@ of **M Jev calls**. The CLI gathers a diff and local source context, screens for
 likely errors, and spends its remaining calls narrowing several candidates to
 individual lines. Findings are advisory; keep running your real compiler.
 
-## Install
+## Historical setup
 
-```sh
-cargo install jev-compile --locked
-# Or:
-npm install -g jev-compile
-```
+The following describes the retired prototype, not a supported installation.
 
 Git and Rust 1.89+ are required. The npm package also requires Node 18+ and Cargo:
 it builds the bundled Rust source on first invocation and caches the executable
